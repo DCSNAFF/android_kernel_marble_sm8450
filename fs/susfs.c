@@ -839,9 +839,11 @@ out_copy_to_user:
 /* susfs avc log spoofing */
 static DEFINE_SPINLOCK(susfs_spin_lock_set_avc_log_spoofing);
 extern bool susfs_is_avc_log_spoofing_enabled;
+extern void ksu_avc_spoof_susfs_on(void);
 
 void susfs_set_avc_log_spoofing(void __user **user_info) {
 	struct st_susfs_avc_log_spoofing info = {0};
+	int old_enabled;
 
 	if (copy_from_user(&info, (struct st_susfs_avc_log_spoofing __user*)*user_info, sizeof(info))) {
 		info.err = -EFAULT;
@@ -849,8 +851,14 @@ void susfs_set_avc_log_spoofing(void __user **user_info) {
 	}
 
 	spin_lock(&susfs_spin_lock_set_avc_log_spoofing);
+	old_enabled = susfs_is_avc_log_spoofing_enabled;
 	susfs_is_avc_log_spoofing_enabled = info.enabled;
 	spin_unlock(&susfs_spin_lock_set_avc_log_spoofing);
+
+	if (info.enabled && !old_enabled) {
+		ksu_avc_spoof_susfs_on();
+	}
+
 	SUSFS_LOGI("susfs_is_avc_log_spoofing_enabled: %d\n", info.enabled);
 	info.err = 0;
 out_copy_to_user:
