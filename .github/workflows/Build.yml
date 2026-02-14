@@ -12,7 +12,7 @@ jobs:
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          submodules: false
+          submodules: recursive  # Biar lebih aman kalau ada submodules
 
       - name: Install dependencies + lld
         run: |
@@ -21,11 +21,11 @@ jobs:
 
       - name: Download and Setup AOSP Clang r584948b
         run: |
-          mkdir -p \~/aosp-clang
-          cd \~/aosp-clang
-          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/42d2c090c14c9c7f4dfd365ae551e2b959dc775c/clang-r584948b.tar.gz -O clang-r584948b.tar.gz
-          tar -xzf clang-r584948b.tar.gz
-          rm clang-r584948b.tar.gz
+          mkdir -p $HOME/aosp-clang
+          cd $HOME/aosp-clang
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/42d2c090c14c9c7f4dfd365ae551e2b959dc775c/clang-r584948b.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz
+          rm clang.tar.gz
           echo "$HOME/aosp-clang/bin" >> $GITHUB_PATH
           clang --version
           ld.lld --version
@@ -33,29 +33,43 @@ jobs:
       - name: Super Clean source tree
         run: |
           make ARCH=arm64 mrproper || true
-          rm -f .config* .*.cmd *.o *.ko Module.symvers vmlinux System.map .version .old .tmp_versions || true
-          rm -rf out scripts/basic/* scripts/kconfig/* .tmp* .*.swp || true
+          rm -rf out .config* .*.cmd *.o *.ko Module.symvers vmlinux System.map .version .old .tmp_versions scripts/basic/* scripts/kconfig/* .tmp* .*.swp || true
           git clean -fdx -e .github/ || true
           git reset --hard HEAD || true
           git status --porcelain || true
 
-      - name: Apply SukiSU-Ultra patches (includes KPM base)
+      - name: Apply SukiSU-Ultra KernelPatch patches (includes KPM base)
         run: |
           git clone https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch --depth=1 sukisu-patches
-          cd sukisu-patches
-          bash setup.sh main || echo "Warnings OK"
-          cd ..
+          # Manual apply patches (karena no setup.sh)
+          cd sukisu-patches/patch
+          for patch in *.patch; do
+            if [ -f "$patch" ]; then
+              echo "Applying SukiSU patch: $patch"
+              patch -p1 --directory=../../../ < "$patch" || echo "Patch $patch failed (maybe already applied or conflict)"
+            fi
+          done
+          cd ../../..
+          # Tambah config dasar yang dibutuhkan KernelPatch/SukiSU
+          mkdir -p out
+          echo "CONFIG_KSU=y" >> out/.config || true
+          echo "CONFIG_KPM=y" >> out/.config || true
+          echo "CONFIG_KALLSYMS=y" >> out/.config || true
+          echo "CONFIG_KALLSYMS_ALL=y" >> out/.config || true
 
-      - name: Apply SUSFS patches
+      - name: Apply SUSFS patches for KernelSU hiding
         run: |
           git clone https://github.com/infectedmushi/susfs4ksu --depth=1 susfs-patches
           cd susfs-patches/kernel_patches
           for patch in *.patch; do
-            echo "Applying $patch..."
-            patch -p1 --directory=../../../ < "$patch" || echo "Patch $patch failed"
+            if [ -f "$patch" ]; then
+              echo "Applying SUSFS patch: $patch"
+              patch -p1 --directory=../../../ < "$patch" || echo "Patch $patch failed (check if version match kernel 5.10)"
+            fi
           done
           cd ../../..
-          echo 'CONFIG_SUSFS=y' >> out/.config || true
+          # Config SUSFS (benar: CONFIG_KSU_SUSFS=y, bukan CONFIG_SUSFS)
+          echo "CONFIG_KSU_SUSFS=y" >> out/.config || true
 
       - name: Build GKI Kernel with ArteXCrit tag + KPM
         env:
@@ -69,20 +83,21 @@ jobs:
         run: |
           export PATH=$HOME/aosp-clang/bin:$PATH
           make O=out ARCH=arm64 gki_defconfig
+          # Tambah localversion & config extra
           echo 'CONFIG_LOCALVERSION="-ArteXCrit-SukiSU-SUSFS-KPM"' >> out/.config
-          echo 'CONFIG_KPM=y' >> out/.config
-          echo 'CONFIG_KALLSYMS=y' >> out/.config
-          echo 'CONFIG_KALLSYMS_ALL=y' >> out/.config || true
+          echo 'CONFIG_MODULES=y' >> out/.config || true  # Biar KPM bisa load module kalau perlu
           make O=out ARCH=arm64 olddefconfig
-          make O=out ARCH=arm64 -j$(nproc --all) CC=clang LD=ld.lld
+          make O=out ARCH=arm64 -j$(nproc --all)
 
       - name: Package AnyKernel3 Zip with Custom Script
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
-          cp out/arch/arm64/boot/Image* AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/ || true
+          # Copy kernel image (support Image atau Image.gz-dtb)
+          cp out/arch/arm64/boot/Image* AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/Image || true
           mkdir -p AnyKernel3/dtb
           find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} AnyKernel3/dtb/ \; || true
 
+          # anykernel.sh custom (sudah bagus, minor tweak)
           cat > AnyKernel3/anykernel.sh << 'EOF'
           properties() { '
           kernel.string=ArteXCrit Kernel with SukiSU-Ultra + SUSFS + KPM by DC
@@ -129,3 +144,9 @@ jobs:
           name: ArteXCrit-Kernel-marble-SukiSU-SUSFS-KPM
           path: ArteXCrit-Marble-SukiSU-SUSFS-KPM.zip
           retention-days: 7
+
+      - name: Debug Config (for troubleshooting)
+        if: always()
+        run: |
+          cat out/.config | grep -E "KSU|SUSFS|KPM|KALLSYMS|LOCALVERSION" || echo "No matching config found"
+          ls -la out/arch/arm64/boot/ || echo "No boot files?"
