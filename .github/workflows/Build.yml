@@ -1,0 +1,84 @@
+name: Build ArteXCrit Kernel with SukiSU-Ultra for Marble
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ lineage-23.2 ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install dependencies + lld (for ld.lld linker)
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison build-essential curl flex git libelf-dev liblz4-tool libncurses5-dev libssl-dev python3 unzip zip zlib1g-dev cpio lzop rsync squashfs-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu lld
+
+      - name: Setup AOSP Clang r547379 via GitHub Mirror
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/msft-mirror-aosp/platform.prebuilts.clang.host.linux-x86.git \~/clang-mirror
+          cd \~/clang-mirror
+          git sparse-checkout add clang-r547379
+          git checkout
+          mkdir -p \~/aosp-clang
+          mv clang-r547379/* \~/aosp-clang/
+          cd \~
+          rm -rf \~/clang-mirror
+          echo "\~/aosp-clang/bin" >> $GITHUB_PATH
+          clang --version
+          ld.lld --version  # Verifikasi lld ada
+
+      - name: Super Clean source tree
+        run: |
+          make ARCH=arm64 mrproper || true
+          rm -f .config* .*.cmd *.o *.ko Module.symvers vmlinux System.map .version .old .tmp_versions || true
+          rm -rf out scripts/basic/* scripts/kconfig/* .tmp* .*.swp || true
+          git clean -fdx -e .github/ || true
+          git reset --hard HEAD || true
+          git status --porcelain || true  # Debug: harus kosong
+
+      - name: Apply SukiSU-Ultra patches
+        run: |
+          git clone https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch --depth=1 sukisu-patches
+          cd sukisu-patches
+          bash setup.sh main || echo "Warnings OK"
+          cd ..
+
+      - name: Build GKI Kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          CC: clang
+          LD: ld.lld  # Force pakai ld.lld
+          CLANG_TRIPLE: aarch64-linux-gnu-
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+        run: |
+          export PATH=\~/aosp-clang/bin:$PATH
+          make O=out ARCH=arm64 gki_defconfig
+          # Tambah nama kernel di out/.config
+          echo 'CONFIG_LOCALVERSION="-ArteXCrit"' >> out/.config
+          make O=out ARCH=arm64 olddefconfig  # Apply config change
+          make O=out ARCH=arm64 -j$(nproc --all) CC=clang LD=ld.lld
+
+      - name: Package AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1
+          cp out/arch/arm64/boot/Image* AnyKernel3/
+          find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} AnyKernel3/ \; || true
+          cd AnyKernel3
+          zip -r ../ArteXCrit-Marble-SukiSU.zip * -x .git
+          cd ..
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArteXCrit-Kernel-marble
+          path: ArteXCrit-Marble-SukiSU.zip
+          retention-days: 7
+          
