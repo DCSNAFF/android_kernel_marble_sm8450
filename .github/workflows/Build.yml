@@ -1,4 +1,4 @@
-name: Build ArteXCrit Kernel with SukiSU-Ultra for Marble
+name: Build ArteXCrit Kernel with SukiSU-Ultra + SUSFS + KPM for Marble
 
 on:
   workflow_dispatch:
@@ -14,24 +14,21 @@ jobs:
         with:
           submodules: false
 
-      - name: Install dependencies + lld (for ld.lld linker)
+      - name: Install dependencies + lld
         run: |
           sudo apt update
-          sudo apt install -y bc bison build-essential curl flex git libelf-dev liblz4-tool libncurses5-dev libssl-dev python3 unzip zip zlib1g-dev cpio lzop rsync squashfs-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu lld
+          sudo apt install -y bc bison build-essential curl flex git libelf-dev liblz4-tool libncurses5-dev libssl-dev python3 unzip zip zlib1g-dev cpio lzop rsync squashfs-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu lld wget patch
 
-      - name: Setup AOSP Clang r547379 via GitHub Mirror
+      - name: Download and Setup AOSP Clang r584948b
         run: |
-          git clone --depth=1 --filter=blob:none --sparse https://github.com/msft-mirror-aosp/platform.prebuilts.clang.host.linux-x86.git \~/clang-mirror
-          cd \~/clang-mirror
-          git sparse-checkout add clang-r547379
-          git checkout
           mkdir -p \~/aosp-clang
-          mv clang-r547379/* \~/aosp-clang/
-          cd \~
-          rm -rf \~/clang-mirror
-          echo "\~/aosp-clang/bin" >> $GITHUB_PATH
+          cd \~/aosp-clang
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/42d2c090c14c9c7f4dfd365ae551e2b959dc775c/clang-r584948b.tar.gz -O clang-r584948b.tar.gz
+          tar -xzf clang-r584948b.tar.gz
+          rm clang-r584948b.tar.gz
+          echo "$HOME/aosp-clang/bin" >> $GITHUB_PATH
           clang --version
-          ld.lld --version  # Verifikasi lld ada
+          ld.lld --version
 
       - name: Super Clean source tree
         run: |
@@ -40,45 +37,95 @@ jobs:
           rm -rf out scripts/basic/* scripts/kconfig/* .tmp* .*.swp || true
           git clean -fdx -e .github/ || true
           git reset --hard HEAD || true
-          git status --porcelain || true  # Debug: harus kosong
+          git status --porcelain || true
 
-      - name: Apply SukiSU-Ultra patches
+      - name: Apply SukiSU-Ultra patches (includes KPM base)
         run: |
           git clone https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch --depth=1 sukisu-patches
           cd sukisu-patches
           bash setup.sh main || echo "Warnings OK"
           cd ..
 
-      - name: Build GKI Kernel
+      - name: Apply SUSFS patches
+        run: |
+          git clone https://github.com/infectedmushi/susfs4ksu --depth=1 susfs-patches
+          cd susfs-patches/kernel_patches
+          for patch in *.patch; do
+            echo "Applying $patch..."
+            patch -p1 --directory=../../../ < "$patch" || echo "Patch $patch failed"
+          done
+          cd ../../..
+          echo 'CONFIG_SUSFS=y' >> out/.config || true
+
+      - name: Build GKI Kernel with ArteXCrit tag + KPM
         env:
           ARCH: arm64
           SUBARCH: arm64
           CC: clang
-          LD: ld.lld  # Force pakai ld.lld
+          LD: ld.lld
           CLANG_TRIPLE: aarch64-linux-gnu-
           CROSS_COMPILE: aarch64-linux-gnu-
           CROSS_COMPILE_ARM32: arm-linux-gnueabi-
         run: |
-          export PATH=\~/aosp-clang/bin:$PATH
+          export PATH=$HOME/aosp-clang/bin:$PATH
           make O=out ARCH=arm64 gki_defconfig
-          # Tambah nama kernel di out/.config
-          echo 'CONFIG_LOCALVERSION="-ArteXCrit"' >> out/.config
-          make O=out ARCH=arm64 olddefconfig  # Apply config change
+          echo 'CONFIG_LOCALVERSION="-ArteXCrit-SukiSU-SUSFS-KPM"' >> out/.config
+          echo 'CONFIG_KPM=y' >> out/.config
+          echo 'CONFIG_KALLSYMS=y' >> out/.config
+          echo 'CONFIG_KALLSYMS_ALL=y' >> out/.config || true
+          make O=out ARCH=arm64 olddefconfig
           make O=out ARCH=arm64 -j$(nproc --all) CC=clang LD=ld.lld
 
-      - name: Package AnyKernel3
+      - name: Package AnyKernel3 Zip with Custom Script
         run: |
-          git clone https://github.com/osm0sis/AnyKernel3 --depth=1
-          cp out/arch/arm64/boot/Image* AnyKernel3/
-          find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} AnyKernel3/ \; || true
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
+          cp out/arch/arm64/boot/Image* AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/ || true
+          mkdir -p AnyKernel3/dtb
+          find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} AnyKernel3/dtb/ \; || true
+
+          cat > AnyKernel3/anykernel.sh << 'EOF'
+          properties() { '
+          kernel.string=ArteXCrit Kernel with SukiSU-Ultra + SUSFS + KPM by DC
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=1
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          boot_attributes() {
+            set_perm_recursive 0 0 755 644 $ramdisk/*;
+            set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
+          }
+
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          ui_print "Installing ArteXCrit Kernel with SukiSU-Ultra + SUSFS + KPM..."
+          split_boot;
+          flash_boot;
+          ui_print "ArteXCrit Kernel installed successfully!";
+          EOF
+
           cd AnyKernel3
-          zip -r ../ArteXCrit-Marble-SukiSU.zip * -x .git
+          zip -r9 ../ArteXCrit-Marble-SukiSU-SUSFS-KPM.zip * -x .git README.md *placeholder LICENSE ./*.md
           cd ..
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ArteXCrit-Kernel-marble
-          path: ArteXCrit-Marble-SukiSU.zip
+          name: ArteXCrit-Kernel-marble-SukiSU-SUSFS-KPM
+          path: ArteXCrit-Marble-SukiSU-SUSFS-KPM.zip
           retention-days: 7
-          
